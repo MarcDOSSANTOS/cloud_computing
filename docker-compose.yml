@@ -1,0 +1,216 @@
+# ============================================
+# TechShop - Docker Compose (développement local)
+# ============================================
+# Usage :
+#   docker compose up -d          → Démarrer tous les services
+#   docker compose logs -f        → Voir les logs
+#   docker compose down           → Arrêter tout
+#   docker compose build          → Rebuild les images
+# ============================================
+
+version: '3.8'
+
+services:
+  # ==========================================
+  # Infrastructure
+  # ==========================================
+  
+  database:
+    image: postgres:16-alpine
+    container_name: techshop-database
+    environment:
+      POSTGRES_DB: techshop
+      POSTGRES_USER: techshop
+      POSTGRES_PASSWORD: techshop_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U techshop"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - techshop-network
+
+  cache:
+    image: redis:7-alpine
+    container_name: techshop-cache
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - techshop-network
+
+  message-queue:
+    image: rabbitmq:3.12-management-alpine
+    container_name: techshop-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Interface de management
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - techshop-network
+
+  # ==========================================
+  # Microservices applicatifs
+  # ==========================================
+
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    container_name: techshop-user-service
+    environment:
+      DATABASE_URL: postgresql://techshop:techshop_password@database:5432/techshop
+      JWT_SECRET: techshop-secret-key-change-in-production
+      REDIS_URL: redis://cache:6379
+    ports:
+      - "8001:8001"
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - techshop-network
+
+  product-service:
+    build:
+      context: ./product-service
+      dockerfile: Dockerfile
+    container_name: techshop-product-service
+    environment:
+      DB_HOST: database
+      DB_PORT: "5432"
+      DB_NAME: techshop
+      DB_USERNAME: techshop
+      DB_PASSWORD: techshop_password
+      REDIS_HOST: cache
+      REDIS_PORT: "6379"
+    ports:
+      - "8002:8002"
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - techshop-network
+
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    container_name: techshop-order-service
+    environment:
+      DB_HOST: database
+      DB_PORT: "5432"
+      DB_NAME: techshop
+      DB_USERNAME: techshop
+      DB_PASSWORD: techshop_password
+      RABBITMQ_URL: amqp://guest:guest@message-queue:5672/
+      REDIS_URL: redis://cache:6379
+    ports:
+      - "8003:8003"
+    depends_on:
+      database:
+        condition: service_healthy
+      message-queue:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - techshop-network
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    container_name: techshop-api-gateway
+    environment:
+      PORT: "3000"
+      NODE_ENV: development
+      JWT_SECRET: techshop-secret-key-change-in-production
+      USER_SERVICE_URL: http://user-service:8001
+      PRODUCT_SERVICE_URL: http://product-service:8002
+      ORDER_SERVICE_URL: http://order-service:8003
+    ports:
+      - "3000:3000"
+    depends_on:
+      - user-service
+      - product-service
+      - order-service
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - techshop-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: techshop-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - api-gateway
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - techshop-network
+
+# ==========================================
+# Volumes persistants
+# ==========================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+
+# ==========================================
+# Réseau
+# ==========================================
+networks:
+  techshop-network:
+    driver: bridge
+    name: techshop-network
